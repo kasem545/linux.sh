@@ -1,252 +1,160 @@
 #!/usr/bin/env python3
+
 import argparse
 import requests
-import json
 import os
-import base64
-from os.path import expanduser
+import json
 import csv
-#https://github.com/ricmoo/pyaes
-import pyaes
+from datetime import datetime
+from pathlib import Path
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import getpass
-#https://github.com/ricmoo/pyscrypt
-import pyscrypt
-from datetime import date,datetime
+import secrets
+import traceback
+
+CONFIG_PATH = Path.home() / ".linux.sh_meta.csv"
+DEFAULT_SCRYPT_N = 2**14
+DEFAULT_SCRYPT_R = 8
+DEFAULT_SCRYPT_P = 1
+
+BASE_URL = "https://linux.sh/"
+TOR_URL = "http://7b42twezybs23hrr.onion/"
 
 now = datetime.now()
 
-def cleanupFileList():
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	lines=""
-	try:
-		with open(file, 'rt') as csvfile:
-			csvreader = csv.reader(csvfile)
-			for row in csvreader:
-				expires = row[2]
-				expires = datetime.strptime(expires,"%Y-%m-%d %H:%M:%S")
-				if now > expires:
-					print("File Expired: %s" % (row[1]))
-				else:
-					linux_sh_file = '"%s","%s","%s","%s","%s"\n'%(row[0],row[1],row[2],row[3],row[4])
-					lines = lines + linux_sh_file
-		file = open(file,"w");
-		file.write(lines)
-	except:
-		print("No .linux.sh script")
+def load_file_list():
+    entries = []
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open('r') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                entries.append(row)
+    return entries
 
+def save_file_list(entries):
+    with CONFIG_PATH.open('w') as f:
+        writer = csv.writer(f)
+        for entry in entries:
+            writer.writerow(entry)
 
-parser = argparse.ArgumentParser(description='Send some files to Linux.sh for safe keeping')
-parser.add_argument("--upload", help="Set File to Upload")
-parser.add_argument("--ls", action="store_true",help="List Uploaded Files",default=False)
-parser.add_argument("--cleanup", action="store_true",help="Cleanup The Upload File",default=False)
-parser.add_argument("--encrypt", action="store_true",help="Perform Local File Encryption",default=False)
-parser.add_argument("--meta", help="Fetch File Metadata (json Returned)")
-parser.add_argument("--rm", help="Remove a File")
-parser.add_argument("--download", help="Download a file")
-parser.add_argument("--tor", action="store_true",help="Use Tor Proxy, See README.md",default=False);
-parser.add_argument("--exportshare", help="Get A Filesharing code");
-parser.add_argument("--importshare", help="Import A File Sharing Code");
-parser.add_argument("--socksport", help="Socks Port For TOR Or Whatever (default 9050)");
-parser.add_argument("--socksip", help="Socks IP Address (default 127.0.0.1)");
+def cleanup_file_list(entries):
+    cleaned = []
+    for row in entries:
+        expires = datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S")
+        if now > expires:
+            print(f"File expired: {row[1]}")
+        else:
+            cleaned.append(row)
+    return cleaned
+
+def derive_key(password, salt):
+    kdf = Scrypt(salt=salt, length=32, n=DEFAULT_SCRYPT_N, r=DEFAULT_SCRYPT_R, p=DEFAULT_SCRYPT_P, backend=default_backend())
+    return kdf.derive(password.encode())
+
+def encrypt_file(in_path, out_path, password):
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    key = derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    with open(in_path, 'rb') as f:
+        data = f.read()
+    ct = aesgcm.encrypt(nonce, data, None)
+    with open(out_path, 'wb') as f:
+        f.write(salt + nonce + ct)
+
+def decrypt_content(content, password):
+    salt = content[:16]
+    nonce = content[16:28]
+    ct = content[28:]
+    key = derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ct, None)
+
+def upload_file(file_path, proxies=None):
+    with open(file_path, 'rb') as f:
+        response = requests.post(BASE_URL + 'upload.php', files={'file': f}, proxies=proxies)
+    if response.status_code != 200:
+        raise Exception("Upload failed")
+    return json.loads(response.content)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--upload")
+parser.add_argument("--encrypt", action="store_true")
+parser.add_argument("--ls", action="store_true")
+parser.add_argument("--cleanup", action="store_true")
+parser.add_argument("--download")
+parser.add_argument("--rm")
+parser.add_argument("--tor", action="store_true")
 args = parser.parse_args()
-proxies = {}
-base_url="https://linux.sh/"
-socksport=9050
-socksip="127.0.0.1"
 
-if args.socksip:
-	socksip=args.socksip
+entries = load_file_list()
+entries = cleanup_file_list(entries)
 
-if args.socksport:
-	socksport=args.socksport
+try:
+    if args.ls:
+        print("Currently uploaded files:")
+        for row in entries:
+            print(f"Filename: {row[0]}, Upload: {row[1]}, Expires: {row[2]}")
 
-if args.tor:
-	proxies={'http':'socks5h://'+socksip+':'+socksport}
-	base_url="http://7b42twezybs23hrr.onion/"
+    if args.upload:
+        ufile = Path(args.upload)
+        encrypted_flag = "0"
+        final_path = ufile
 
-if args.exportshare:
-	cleanupFileList()
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	with open(file, 'rt') as csvfile:
-		csvreader = csv.reader(csvfile)
-		for row in csvreader:
-			if row[1] == args.exportshare:
-				response = requests.post(base_url+'share.php',proxies=proxies,data={'filename':args.exportshare,'control':row[3],'encrypted':row[4]})
-				parsed_json = json.loads(response.content)
-				print ("Share Name: %s" % (parsed_json['share']))
-				found=True
-	if not found:
-		print("File Not Found")
+        if args.encrypt:
+            password = getpass.getpass("Password: ")
+            enc_path = ufile.with_suffix(ufile.suffix + ".enc")
+            encrypt_file(ufile, enc_path, password)
+            final_path = enc_path
+            encrypted_flag = "1"
 
-if args.importshare:
-	cleanupFileList()
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	base64 = base64.b64decode(args.importshare)
-	line = base64.decode("utf-8")
-	f = open(file, 'ab')
-	f.write(line.encode())
-	f.write("\n".encode())
-	cleanupFileList()
+        proxies = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"} if args.tor else None
+        meta = upload_file(final_path, proxies=proxies)
 
-if args.upload:
-	if os.path.getsize(args.upload) > 10485760:
-		print("File Size is too large, limit is 10MB")
-		quit()
-	home = expanduser("~")
-	ufile = args.upload
-	encrypt_file=""
-	upload_filename = os.path.basename(args.upload)
-	encrypted=0
-	if args.encrypt:
-		pass1 = getpass.getpass("Enter Password: ")
-		pass2 = getpass.getpass("Reenter Password: ")
-		if (pass1 != pass2):
-			print("Password Mismatch")
-			quit()
-		key = pass1.encode()
-		#key = b"1234"
-		salt= b":&\WRdDv6'MvK{8C"
-		N = 1024
-		r = 1
-		p = 1
-		key_32 = pyscrypt.hash(key, salt, N, r, p, 32)
-		mode = pyaes.AESModeOfOperationCTR(key_32)
-		filename_w_ext = os.path.basename(ufile)
-		ufile = home + "/" + filename_w_ext + ".aes"
-		print(args.upload)
-		file_in = open(args.upload,'rb')
-		file_out = open(ufile, 'wb')
-		print("Encrypting File: %s This will take awhile if the file is big"%(args.upload))
-		pyaes.encrypt_stream(mode, file_in, file_out)
-		print("Uploading File: %s "%(args.upload))
-		file_in.close()
-		file_out.close()
-		encrypt_file=ufile
-		encrypted=1
-	response = requests.post(base_url+'upload.php', proxies=proxies, files={'file': (upload_filename, open(ufile, 'rb'), 'application/octet-stream', {'Expires': '0'})})
-	if response.status_code != 200:
-		print("Error Uploading File")
-		quit()
-	parsed_json = json.loads(response.content)
-	print ("File Uploaded")
-	print ("Original Filename: %s" % (parsed_json['filename']['OriginalFileName']))
-	print ("Uploaded Filename: %s" % (parsed_json['filename']['UploadFilename']))
-	print ("File Expires: %s" % (parsed_json['filename']['UploadExpires']))
-	print ("File Hash: %s" % (parsed_json['filename']['UploadHash']))
-	print ("File Hash After Upload: %s" % (parsed_json['filename']['UploadHashAfterEncryption']))
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	linux_sh_file = '"%s","%s","%s","%s","%s"\n'%(parsed_json['filename']['OriginalFileName'],parsed_json['filename']['UploadFilename'],parsed_json['filename']['UploadExpires'],parsed_json['filename']['UploadControlKey'],encrypted)
-	if encrypt_file != "":
-		os.remove(encrypt_file)
-	try:
-		cleanupFileList()
-	except:
-		print("Linux.sh config file not found, creating it")
+        print("Upload complete")
+        print(f"Original Filename: {meta['filename']['OriginalFileName']}")
+        print(f"Uploaded Filename: {meta['filename']['UploadFilename']}")
+        print(f"File Expires: {meta['filename']['UploadExpires']}")
+        print(f"File Hash: {meta['filename']['UploadHash']}")
+        print(f"File Hash After Upload: {meta['filename']['UploadHashAfterEncryption']}")
 
-	f = open(file,"a")
-	f.write(linux_sh_file)
-if args.ls:
-	cleanupFileList()
-	print("Currently Uploaded Files")
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	with open(file, 'rt') as csvfile:
-		csvreader = csv.reader(csvfile)
-		for row in csvreader:
-			print("Filename: %s, Upload Filename: %s, File Expires: %s" % (row[0],row[1],row[2]))
+        entries.append([
+            meta['filename']['OriginalFileName'],
+            meta['filename']['UploadFilename'],
+            meta['filename']['UploadExpires'],
+            meta['filename']['UploadControlKey'],
+            encrypted_flag
+        ])
 
-if args.cleanup:
-	cleanupFileList()
-if args.meta:
-	cleanupFileList()
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	found = False
-	try:
-		with open(file, 'rt') as csvfile:
-			csvreader = csv.reader(csvfile)
-			for row in csvreader:
-				if row[1] == args.meta:
-					response = requests.post(base_url+'meta.php',proxies=proxies,data={'filename':args.meta,'control':row[3]})
-					print(response.content)
-					found=True
-		if not found:
-			print("File Not Found")
+        if final_path != ufile:
+            final_path.unlink()
 
-	except Exception as e:
-		print(e)
+    if args.cleanup:
+        print("Cleanup complete.")
 
-if args.rm:
-	cleanupFileList()
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	found = False
-	lines=""
-	try:
-		with open(file, 'rt') as csvfile:
-			csvreader = csv.reader(csvfile)
-			for row in csvreader:
-				if row[1] == args.rm:
-					response = requests.post(base_url+'rm.php',proxies=proxies,data={'filename':args.rm,'control':row[3]})
-					found=True
-		if not found:
-			print("File Not Found")
-		else:
-			with open(file, 'rt') as csvfile:
-				csvreader = csv.reader(csvfile)
-				for row in csvreader:
-					if row[1] != args.rm:
-						linux_sh_file = '"%s","%s","%s","%s"\n'%(row[0],row[1],row[2],row[3],row[4])
-						lines = lines + linux_sh_file
+    if args.download:
+        found = next((row for row in entries if row[1] == args.download), None)
+        if found:
+            password = None
+            if found[4] == "1":
+                password = getpass.getpass("Password: ")
+            proxies = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"} if args.tor else None
+            r = requests.post(BASE_URL + 'download.php', data={'filename': found[1], 'control': found[3]}, proxies=proxies)
+            data = r.content
+            if password:
+                data = decrypt_content(data, password)
+            with open(found[0], 'wb') as f:
+                f.write(data)
+            print(f"Downloaded and saved as {found[0]}")
+        else:
+            print("File not found in local metadata.")
 
-			file = open(file,"w");
-			file.write(lines)
-	except Exception as e:
-		print(e)
-if args.download:
-	cleanupFileList()
-	home = expanduser("~")
-	file = home + "/.linux.sh"
-	found = False
-	content = ""
-	password = ""
-	encrypted = 0
-	try:
-		with open(file, 'rt') as csvfile:
-			csvreader = csv.reader(csvfile)
-			for row in csvreader:
-				if row[1] == args.download:
-					filename = row[0]
-					if str(row[4]) == "1":
-						password=getpass.getpass("Enter File Encryption Password: ")
-						encrypted=1
+    if args.rm:
+        entries = [row for row in entries if row[1] != args.rm]
+        print("Removed entry from local metadata.")
 
-		with open(file, 'rt') as csvfile:
-			csvreader = csv.reader(csvfile)
-			for row in csvreader:
-				if row[1] == args.download:
-					response = requests.post(base_url+'download.php',proxies=proxies, data={'filename':args.download,'control':row[3]})
-					if encrypted:
-						salt=b":&\WRdDv6'MvK{8C"
-						N = 1024
-						r = 1
-						p = 1
-						key_32 = pyscrypt.hash(password.encode(), salt, N, r, p, 32)
-						mode = pyaes.AESModeOfOperationCTR(key_32)
+finally:
+    save_file_list(entries)
 
-						content = mode.decrypt(response.content)
-					else:
-						content = response.content
-
-					file = open(filename,'wb')
-					file.write(content)
-					found=True
-		if not found:
-			print("File Not Found")
-
-	except Exception as e:
-		print(e)
